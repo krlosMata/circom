@@ -5,59 +5,100 @@ const fs = require("fs");
 var tmp = require("tmp-promise");
 const path = require("path");
 const compiler = require("../../src/compiler");
+const util = require("util");
+const exec = util.promisify(require("child_process").exec);
 
+const Scalar = require("ffjavascript").Scalar;
 const utils = require("../../src/utils");
 const loadR1cs = require("r1csfile").load;
 const ZqField = require("ffjavascript").ZqField;
+const buildZqField = require("ffiasm").buildZqField;
 
-const WitnessCalculatorBuilder = require("circom_runtime").WitnessCalculatorBuilder;
+const {stringifyBigInts, unstringifyBigInts } = require("ffjavascript").utils;
 
-module.exports = wasm_tester;
+module.exports = c_tester;
 
-async function  wasm_tester(circomFile, _options) {
-    // not not cleanup temporary files
-    // tmp.setGracefulCleanup();
+
+async function  c_tester(pathCircom, circomFile) {
 
     const dir = await tmp.dir({prefix: "circom_", unsafeCleanup: true });
-
-    // print temporary circom files
-    console.log(dir.path);
 
     const baseName = path.basename(circomFile, ".circom");
     const options = Object.assign({}, _options);
 
-    options.wasmWriteStream = fs.createWriteStream(path.join(dir.path, baseName + ".wasm"));
+    options.cSourceWriteStream = fs.createWriteStream(path.join(dir.path, baseName + ".cpp"));
     options.symWriteStream = fs.createWriteStream(path.join(dir.path, baseName + ".sym"));
     options.r1csFileName = path.join(dir.path, baseName + ".r1cs");
 
-    const promisesArr = [];
-    promisesArr.push(new Promise(fulfill => options.wasmWriteStream.on("finish", fulfill)));
-
+    options.p = options.p || Scalar.fromString("21888242871839275222246405745257275088548364400416034343698204186575808495617");
     await compiler(circomFile, options);
 
-    await Promise.all(promisesArr);
+    const source = await buildZqField(options.p, "Fr");
 
-    const wasm = await fs.promises.readFile(path.join(dir.path, baseName + ".wasm"));
+    await fs.promises.writeFile(path.join(dir.path, "fr.asm"), source.asm, "utf8");
+    await fs.promises.writeFile(path.join(dir.path, "fr.h"), source.h, "utf8");
+    await fs.promises.writeFile(path.join(dir.path, "fr.c"), source.c, "utf8");
 
-    const wc = await WitnessCalculatorBuilder(wasm);
+    let pThread = "";
 
-    return new WasmTester(dir, baseName, wc);
+    if (process.platform === "darwin") {
+        await exec("nasm -fmacho64 --prefix _ " +
+            ` ${path.join(dir.path,  "fr.asm")}`
+        );
+    }  else if (process.platform === "linux") {
+        pThread = "-pthread";
+        await exec("nasm -felf64 " +
+            ` ${path.join(dir.path,  "fr.asm")}`
+        );
+    } else throw("Unsupported platform");
+
+    const cdir = path.join(path.dirname(require.resolve("circom_runtime")), "c");
+
+    await exec("g++" + ` ${pThread}` +
+               ` ${path.join(cdir,  "main.cpp")}` +
+               ` ${path.join(cdir,  "calcwit.cpp")}` +
+               ` ${path.join(cdir,  "utils.cpp")}` +
+               ` ${path.join(dir.path,  "fr.c")}` +
+               ` ${path.join(dir.path,  "fr.o")}` +
+               ` ${path.join(dir.path, baseName + ".cpp")} ` +
+               ` -o ${path.join(dir.path, baseName)}` +
+               ` -I ${dir.path} -I${cdir}` +
+               " -lgmp -std=c++11 -DSANITY_CHECK -g"
+    );
+
+    // console.log(dir.path);
+    return new CTester(dir, baseName);
 }
 
-class WasmTester {
+class CTester {
 
-    constructor(dir, baseName, witnessCalculator) {
+    constructor(dir, baseName) {
         this.dir=dir;
         this.baseName = baseName;
-        this.witnessCalculator = witnessCalculator;
     }
 
     async release() {
         await this.dir.cleanup();
     }
 
-    async calculateWitness(input, sanityCheck) {
-        return await this.witnessCalculator.calculateWitness(input, sanityCheck);
+    async calculateWitness(input) {
+        await fs.promises.writeFile(
+            path.join(this.dir.path, "in.json"),
+            JSON.stringify(stringifyBigInts(input), null, 1)
+        );
+        const r = await exec(`${path.join(this.dir.path, this.baseName)}` +
+                   ` ${path.join(this.dir.path, "in.json")}` +
+                   ` ${path.join(this.dir.path, "out.json")}`
+        );
+        if (r.stdout) {
+            console.log(r.stdout);
+        }
+        const resStr = await fs.promises.readFile(
+            path.join(this.dir.path, "out.json")
+        );
+
+        const res = unstringifyBigInts(JSON.parse(resStr));
+        return res;
     }
 
     async loadSymbols() {
@@ -144,7 +185,7 @@ class WasmTester {
             const b = evalLC(constraint[1]);
             const c = evalLC(constraint[2]);
 
-            assert (F.isZero(F.sub(F.mul(a,b), c)), "Constraint doesn't match");
+            assert (F.sub(F.mul(a,b), c).isZero(), "Constraint doesn't match");
         }
 
         function evalLC(lc) {

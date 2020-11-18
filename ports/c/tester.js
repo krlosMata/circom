@@ -20,11 +20,13 @@ module.exports = c_tester;
 
 
 async function  c_tester(circomFile, _options) {
-    tmp.setGracefulCleanup();
+    // not not cleanup temporary files
+    // tmp.setGracefulCleanup();
 
     const dir = await tmp.dir({prefix: "circom_", unsafeCleanup: true });
 
-    // console.log(dir.path);
+    // print temporary circom files
+    console.log(dir.path);
 
     const baseName = path.basename(circomFile, ".circom");
     const options = Object.assign({}, _options);
